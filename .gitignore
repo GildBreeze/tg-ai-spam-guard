@@ -1,0 +1,8 @@
+# Runtime secrets and local state
+config.env
+data/
+logs/
+venv/
+__pycache__/
+*.py[cod]
+.env
