@@ -82,6 +82,8 @@ SELF_UNBAN_ENABLED=true
 SELF_UNBAN_COOLDOWN_MINUTES=10
 SELF_UNBAN_MAX_PER_DAY=3
 SELF_UNBAN_OBSERVE_HOURS=24
+# 广告处理提示保留秒数；0=不自动删除
+NOTICE_DELETE_SECONDS=120
 
 # 管理员/白名单跳过审核
 SKIP_ADMINS=true
@@ -145,6 +147,7 @@ SELF_UNBAN_ENABLED = os.getenv("SELF_UNBAN_ENABLED", "true").lower() == "true"
 SELF_UNBAN_COOLDOWN_MINUTES = int(os.getenv("SELF_UNBAN_COOLDOWN_MINUTES", "10"))
 SELF_UNBAN_MAX_PER_DAY = int(os.getenv("SELF_UNBAN_MAX_PER_DAY", "3"))
 SELF_UNBAN_OBSERVE_HOURS = int(os.getenv("SELF_UNBAN_OBSERVE_HOURS", "24"))
+NOTICE_DELETE_SECONDS = int(os.getenv("NOTICE_DELETE_SECONDS", "120"))
 SKIP_ADMINS = os.getenv("SKIP_ADMINS", "true").lower() == "true"
 
 DB_PATH = os.path.join(APP_DIR, "data", "bot.db")
@@ -688,15 +691,31 @@ async def handle_spam(update: Update, context: ContextTypes.DEFAULT_TYPE, ai: Ai
         await log_action(chat, user, text, ai, action, ok, err)
 
 
+async def delete_notice_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    try:
+        await context.bot.delete_message(data["chat_id"], data["message_id"])
+    except TelegramError as e:
+        # It may already have been removed by an admin; this is not an operational error.
+        log.info("notice auto-delete skipped chat=%s message=%s err=%s", data.get("chat_id"), data.get("message_id"), e)
+
+
 async def send_spam_notice(chat, target_user_id: int, action: str, context: ContextTypes.DEFAULT_TYPE):
-    """Send a safe public notice that does not repeat the ad content."""
+    """Send a safe short notice, then remove it automatically to keep the group clean."""
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("封禁用户点击自助解除封禁", callback_data=f"self_unban:{chat.id}:{target_user_id}")],
         [InlineKeyboardButton("管理员点击解禁", callback_data=f"admin_unban:{chat.id}:{target_user_id}")],
     ])
     action_text = "已封禁" if action == "ban" else ("已禁言" if action == "mute" else "已删除")
     try:
-        await context.bot.send_message(chat.id, f"识别为广告，{action_text}。", reply_markup=keyboard)
+        notice = await context.bot.send_message(chat.id, f"识别为广告，{action_text}。", reply_markup=keyboard)
+        if NOTICE_DELETE_SECONDS > 0:
+            context.job_queue.run_once(
+                delete_notice_job,
+                when=NOTICE_DELETE_SECONDS,
+                data={"chat_id": chat.id, "message_id": notice.message_id},
+                name=f"delete_notice:{chat.id}:{notice.message_id}",
+            )
     except TelegramError:
         pass
 
