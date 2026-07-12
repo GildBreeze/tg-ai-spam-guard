@@ -104,6 +104,7 @@ EOF_REQ
 #!/usr/bin/env python3
 import asyncio
 import hashlib
+from html.parser import HTMLParser
 import json
 import logging
 import os
@@ -534,6 +535,55 @@ def message_content(msg) -> str:
     return "\n".join(part for part in parts if part).strip()
 
 
+class TelegramPostPreviewParser(HTMLParser):
+    """Extract visible post text from Telegram's public embed page."""
+    def __init__(self):
+        super().__init__()
+        self._in_text = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        classes = dict(attrs).get("class", "")
+        if tag == "div" and "tgme_widget_message_text" in classes:
+            self._in_text += 1
+        elif self._in_text and tag in {"br", "p"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag == "div" and self._in_text:
+            self._in_text -= 1
+
+    def handle_data(self, data):
+        if self._in_text:
+            self.parts.append(data)
+
+
+async def enrich_telegram_post_links(text: str) -> str:
+    """Attach public t.me/<channel>/<post> preview text for reliable ad checks.
+
+    Telegram delivers only the link in a chat message; its rich preview is client-side
+    and is not present in Bot API Message.text. Fetching the public embed fills that
+    blind spot. Failures deliberately keep the original message usable.
+    """
+    links = re.findall(r"https?://t\.me/([A-Za-z0-9_]{5,})/(\d+)(?:[/?#][^\s]*)?", text, re.I)
+    if not links:
+        return text
+    previews = []
+    async with httpx.AsyncClient(timeout=8, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for channel, post_id in links[:3]:
+            try:
+                response = await client.get(f"https://t.me/{channel}/{post_id}?embed=1&mode=tme")
+                response.raise_for_status()
+                parser = TelegramPostPreviewParser()
+                parser.feed(response.text)
+                preview = " ".join("".join(parser.parts).split())
+                if preview:
+                    previews.append(f"[Telegram链接预览 @{channel}/{post_id}] {preview[:2500]}")
+            except (httpx.HTTPError, ValueError) as e:
+                log.info("telegram link preview unavailable @%s/%s: %s", channel, post_id, e)
+    return "\n".join([text, *previews]) if previews else text
+
+
 def normalize_for_scan(text: str) -> str:
     # Ads commonly insert zero-width characters to evade pattern matching.
     return "".join(ch for ch in unicodedata.normalize("NFKC", text) if unicodedata.category(ch) not in {"Cf", "Cc"})
@@ -581,6 +631,7 @@ async def cmd_checkad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not content:
         await command.reply_text("该消息没有可识别的文字、链接或按钮。")
         return
+    content = await enrich_telegram_post_links(content)
     try:
         result = await local_prefilter(content)
         if result is None:
@@ -787,6 +838,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await handle_spam(update, context, ai, msg.text or msg.caption or "", mode); return
     text = message_content(msg)
     if not text: return
+    text = await enrich_telegram_post_links(text)
     pre = await local_prefilter(text)
     if pre:
         if pre.is_spam: await handle_spam(update, context, pre, text, mode)
@@ -896,13 +948,14 @@ def main():
     app.add_handler(CommandHandler(["whitelist", "whitelist_add", "whitelist_del"], cmd_whitelist))
     app.add_handler(CallbackQueryHandler(callback_self_unban, pattern=r"^(self_unban|admin_unban):"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_private_appeal))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.Caption), handle_group_message))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), handle_group_message))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(periodic_unban, interval=60, first=20)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
+
 EOF_PY
   chmod +x "$APP_DIR/bot.py"
 }
