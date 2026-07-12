@@ -84,6 +84,8 @@ SELF_UNBAN_MAX_PER_DAY=3
 SELF_UNBAN_OBSERVE_HOURS=24
 # 广告处理提示保留秒数；0=不自动删除
 NOTICE_DELETE_SECONDS=120
+# 个人简介检查缓存秒数，避免每条消息都重复查询用户资料
+PROFILE_BIO_CACHE_SECONDS=21600
 
 # 管理员/白名单跳过审核
 SKIP_ADMINS=true
@@ -149,6 +151,7 @@ SELF_UNBAN_COOLDOWN_MINUTES = int(os.getenv("SELF_UNBAN_COOLDOWN_MINUTES", "10")
 SELF_UNBAN_MAX_PER_DAY = int(os.getenv("SELF_UNBAN_MAX_PER_DAY", "3"))
 SELF_UNBAN_OBSERVE_HOURS = int(os.getenv("SELF_UNBAN_OBSERVE_HOURS", "24"))
 NOTICE_DELETE_SECONDS = int(os.getenv("NOTICE_DELETE_SECONDS", "120"))
+PROFILE_BIO_CACHE_SECONDS = int(os.getenv("PROFILE_BIO_CACHE_SECONDS", "21600"))
 SKIP_ADMINS = os.getenv("SKIP_ADMINS", "true").lower() == "true"
 
 DB_PATH = os.path.join(APP_DIR, "data", "bot.db")
@@ -234,6 +237,7 @@ class Store:
             return self.conn.execute(sql, params).fetchall()
 
 store = Store(DB_PATH)
+profile_bio_cache: dict[int, tuple[int, str]] = {}
 user_windows: dict[tuple[int, int], deque] = defaultdict(deque)
 group_ai_windows: dict[int, deque] = defaultdict(deque)
 global_ai_window: deque = deque()
@@ -275,6 +279,21 @@ def parse_duration(s: Optional[str]) -> Optional[int]:
 def display_user(u) -> str:
     name = " ".join(x for x in [u.first_name, u.last_name] if x)
     return name or u.username or str(u.id)
+
+
+async def user_profile_bio(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Read a sender's public Telegram profile bio with a bounded in-memory cache."""
+    cached = profile_bio_cache.get(user_id)
+    if cached and cached[0] > now_ts():
+        return cached[1]
+    bio = ""
+    try:
+        profile = await context.bot.get_chat(user_id)
+        bio = (getattr(profile, "bio", None) or "").strip()
+    except TelegramError as e:
+        log.debug("profile bio unavailable user=%s: %s", user_id, e)
+    profile_bio_cache[user_id] = (now_ts() + PROFILE_BIO_CACHE_SECONDS, bio)
+    return bio
 
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.strip().lower().encode("utf-8", "ignore")).hexdigest()
@@ -833,12 +852,19 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if SKIP_ADMINS and await is_group_admin(chat.id, user.id, context): return
     wl = await store.one("SELECT 1 FROM whitelist WHERE chat_id=? AND user_id=?", (chat.id, user.id))
     if wl: return
+    bio = await user_profile_bio(user.id, context)
+    identity = f"用户名=@{user.username or ''}\n昵称={display_user(user)}\n个人简介={bio}".strip()
+    profile_pre = await local_prefilter(identity)
+    if profile_pre and profile_pre.is_spam:
+        await handle_spam(update, context, profile_pre, f"[用户资料广告]\n{identity}\n[消息]\n{msg.text or msg.caption or ''}", mode)
+        return
     if not await rate_limit_window(user_windows[(chat.id, user.id)], USER_MSG_PER_MINUTE):
         ai = AiResult(True, "medium", "flood", 0.9, "用户短时间发送过多消息", "mute")
         await handle_spam(update, context, ai, msg.text or msg.caption or "", mode); return
     text = message_content(msg)
     if not text: return
     text = await enrich_telegram_post_links(text)
+    text = f"[用户资料]\n{identity}\n[消息]\n{text}"
     pre = await local_prefilter(text)
     if pre:
         if pre.is_spam: await handle_spam(update, context, pre, text, mode)
