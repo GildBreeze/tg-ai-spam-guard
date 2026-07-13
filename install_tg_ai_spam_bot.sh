@@ -843,9 +843,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.effective_message; chat = update.effective_chat; user = update.effective_user
     if not msg or not chat: return
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}: return
-    # Messages sent as a channel or as the group/anonymous admin identity are trusted broadcasts.
-    # Do not delete, mute, ban, or AI-check them; this protects the owner's own channel ads.
-    if is_sender_chat_message(msg): return
+    # Anonymous-admin/group-identity messages are trusted. A post from a linked
+    # channel is not automatically trusted: it can be a forwarded third-party ad.
+    if is_sender_chat_message(msg) and getattr(msg.sender_chat, "id", None) == chat.id:
+        return
     if not user or user.is_bot: return
     if not await ensure_authorized_or_leave(update, context): return
     row = await group_row(chat.id); mode = row["mode"] if row else DEFAULT_MODE
